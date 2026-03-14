@@ -13,18 +13,18 @@
 //+------------------------------------------------------------------+
 #property copyright "XAUUSD Daily Range Strategy"
 #property version   "1.00"
-#property description "Places Buy/Sell Stops at previous day High/Low (Pepperstone, NY time)"
+#property description "Places Buy/Sell Stops at previous day High/Low (Pepperstone, UTC+2)"
 
 #include <Trade\Trade.mqh>
 
 //=== Inputs =========================================================
 
-input group "== Trading Hours (New York Time) =="
-input int    InpTueFriStartHour = 18;       // Tue-Fri Start Hour  (default 6pm)
+input group "== Trading Hours (UTC+2 Broker Server Time) =="
+input int    InpTueFriStartHour = 1;        // Tue-Fri Start Hour  (01:00 = 6pm NY)
 input int    InpTueFriStartMin  = 0;        // Tue-Fri Start Minute
-input int    InpMonStartHour    = 19;       // Monday Start Hour   (default 7pm)
+input int    InpMonStartHour    = 2;        // Monday Start Hour   (02:00 = 7pm NY)
 input int    InpMonStartMin     = 0;        // Monday Start Minute
-input int    InpEndHour         = 12;       // End Hour - all days (default 12pm)
+input int    InpEndHour         = 19;       // End Hour - all days (19:00 = 12pm NY)
 input int    InpEndMin          = 0;        // End Minute
 
 input group "== Strategy Parameters =="
@@ -60,53 +60,18 @@ bool g_sessionReady  = false;  // Valid session data loaded
 int g_lastServerDay = -1;
 
 //+------------------------------------------------------------------+
-//| Returns true if the given UTC timestamp falls within US EDT       |
-//| DST Start: 2nd Sunday of March  at 07:00 UTC (= 2am EST)         |
-//| DST End  : 1st Sunday of November at 06:00 UTC (= 2am EDT)       |
+//| Return current broker server time (UTC+2) as MqlDateTime         |
 //+------------------------------------------------------------------+
-bool IsEDT(datetime utc)
+MqlDateTime GetSrvDateTime()
 {
-   MqlDateTime d;
-   TimeToStruct(utc, d);
-   int year = d.year;
-
-   // --- DST Start: 2nd Sunday of March ---
-   MqlDateTime ms = {};
-   ms.year = year; ms.mon = 3; ms.day = 1; ms.hour = 7;
-   datetime mar1 = StructToTime(ms);
-   MqlDateTime mar1d; TimeToStruct(mar1, mar1d);
-   int dow      = mar1d.day_of_week;                        // 0=Sun
-   int sun1Mar  = 1 + (dow == 0 ? 0 : 7 - dow);            // first Sunday
-   ms.day       = sun1Mar + 7;                              // second Sunday
-   datetime dstStart = StructToTime(ms);
-
-   // --- DST End: 1st Sunday of November ---
-   MqlDateTime ns = {};
-   ns.year = year; ns.mon = 11; ns.day = 1; ns.hour = 6;
-   datetime nov1 = StructToTime(ns);
-   MqlDateTime nov1d; TimeToStruct(nov1, nov1d);
-   dow      = nov1d.day_of_week;
-   ns.day   = 1 + (dow == 0 ? 0 : 7 - dow);                // first Sunday
-   datetime dstEnd = StructToTime(ns);
-
-   return (utc >= dstStart && utc < dstEnd);
-}
-
-//+------------------------------------------------------------------+
-//| Return current time as NY (Eastern) MqlDateTime                  |
-//+------------------------------------------------------------------+
-MqlDateTime GetNYDateTime()
-{
-   datetime utc = TimeGMT();
-   int offset   = IsEDT(utc) ? -4 : -5;
    MqlDateTime dt;
-   TimeToStruct(utc + (long)offset * 3600, dt);
+   TimeToStruct(TimeCurrent(), dt);
    return dt;
 }
 
-// Time comparison helpers
-bool NYTimeGE(int h, int m, const MqlDateTime &ny) { return ny.hour > h || (ny.hour == h && ny.min >= m); }
-bool NYTimeLT(int h, int m, const MqlDateTime &ny) { return ny.hour < h || (ny.hour == h && ny.min <  m); }
+// Time comparison helpers (broker server time)
+bool SrvTimeGE(int h, int m, const MqlDateTime &dt) { return dt.hour > h || (dt.hour == h && dt.min >= m); }
+bool SrvTimeLT(int h, int m, const MqlDateTime &dt) { return dt.hour < h || (dt.hour == h && dt.min <  m); }
 
 //+------------------------------------------------------------------+
 //| Calculate lot size so that SL distance = InpRiskPercent of        |
@@ -313,14 +278,9 @@ int OnInit()
          // Restore any pending orders this EA already placed
          ScanExistingOrders();
 
-         // If already past the observation window, do a quick price breach check
-         // so we don't place orders in a direction already hit
-         MqlDateTime ny  = GetNYDateTime();
-         bool isMon      = (srvDT.day_of_week == 1);
-         int  sH         = isMon ? InpMonStartHour : InpTueFriStartHour;
-         int  sM         = isMon ? InpMonStartMin  : InpTueFriStartMin;
-
-         if (NYTimeGE(17, 0, ny))   // Anywhere in or past the observation window
+         // Do a quick price breach check so we don't place orders in a direction already hit.
+         // Observation always starts at 00:00 server time (candle open), so any mid-day
+         // start is already within or past the observation window.
          {
             double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
             double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
@@ -329,7 +289,7 @@ int OnInit()
          }
 
          // If past end time, mark cleanup done so we don't re-delete anything
-         if (NYTimeGE(InpEndHour, InpEndMin, ny))
+         if (SrvTimeGE(InpEndHour, InpEndMin, srvDT))
             g_cleanupDone = true;
 
          PrintFormat("EA resumed mid-session [DOW=%d] | High=%.2f | Low=%.2f | OrdersPlaced=%s",
@@ -353,14 +313,14 @@ void OnDeinit(const int reason)
 //+------------------------------------------------------------------+
 //| OnTick — Main state machine                                       |
 //|                                                                  |
-//| Phases (all times in New York time):                             |
-//|  [17:00 – StartTime]  Observation  — track price breaches        |
+//| Phases (all times in UTC+2 broker server time):                  |
+//|  [00:00 – StartTime]  Observation  — track price breaches        |
 //|  [StartTime – EndTime] Trading      — manage pending orders       |
 //|  [EndTime+]           Cleanup       — delete untriggered orders   |
 //+------------------------------------------------------------------+
 void OnTick()
 {
-   //--- Detect Pepperstone daily candle rollover (server midnight = 5pm NY)
+   //--- Detect Pepperstone daily candle rollover (server midnight = 00:00 UTC+2)
    MqlDateTime srvDT;
    TimeToStruct(TimeCurrent(), srvDT);
 
@@ -375,14 +335,14 @@ void OnTick()
       return;
 
    //--- Resolve timing parameters for today
-   MqlDateTime ny  = GetNYDateTime();
    bool isMonday   = (srvDT.day_of_week == 1);
    int  sH         = isMonday ? InpMonStartHour : InpTueFriStartHour;
    int  sM         = isMonday ? InpMonStartMin  : InpTueFriStartMin;
 
-   bool inObs      = NYTimeGE(17, 0,          ny) && NYTimeLT(sH, sM,            ny);
-   bool inTrading  = NYTimeGE(sH, sM,         ny) && NYTimeLT(InpEndHour, InpEndMin, ny);
-   bool pastEnd    = NYTimeGE(InpEndHour, InpEndMin, ny);
+   // Observation runs from 00:00 (candle open) up to the trading start time
+   bool inObs      = SrvTimeLT(sH, sM,                        srvDT);
+   bool inTrading  = SrvTimeGE(sH, sM,         srvDT) && SrvTimeLT(InpEndHour, InpEndMin, srvDT);
+   bool pastEnd    = SrvTimeGE(InpEndHour, InpEndMin, srvDT);
 
    //----------------------------------------------------------------
    // Phase 1 — Observation window: track price vs prev High/Low
@@ -416,7 +376,7 @@ void OnTick()
    //----------------------------------------------------------------
    if (pastEnd && !g_cleanupDone)
    {
-      PrintFormat("Trading window closed (%02d:%02d NY). Removing pending orders.", InpEndHour, InpEndMin);
+      PrintFormat("Trading window closed (%02d:%02d UTC+2). Removing pending orders.", InpEndHour, InpEndMin);
       CancelOrder(g_buyTicket,  "Buy-EOD");
       CancelOrder(g_sellTicket, "Sell-EOD");
       g_cleanupDone = true;
