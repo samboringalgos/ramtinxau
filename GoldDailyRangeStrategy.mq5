@@ -191,6 +191,14 @@ void NewSession(int serverDOW)
 //+------------------------------------------------------------------+
 void PlaceOrders()
 {
+   // If market is not fully open yet (e.g. rollover break), retry on next tick
+   ENUM_SYMBOL_TRADE_MODE tradeMode = (ENUM_SYMBOL_TRADE_MODE)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_MODE);
+   if (tradeMode != SYMBOL_TRADE_MODE_FULL)
+   {
+      Print("Market not ready (", EnumToString(tradeMode), "). Retrying next tick.");
+      return; // g_ordersPlaced stays false — will retry
+   }
+
    int    digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
    double lots   = CalcLots(g_slDist);
 
