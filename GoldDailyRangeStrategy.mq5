@@ -1,36 +1,40 @@
 //+------------------------------------------------------------------+
-//|                   XAUUSD Daily Range Strategy                     |
-//|                     Pepperstone MT5 Platform                      |
+//|                   XAUUSD Daily Range Strategy                    |
+//|                     Pepperstone MT5 Platform                     |
 //|                                                                  |
-//|  Logic:                                                           |
-//|  - At 5pm NY (Pepperstone daily candle close), record prev        |
-//|    candle High/Low and begin observation window.                  |
-//|  - During observation, if price breaches High → skip Buy Stop.    |
-//|    If price breaches Low → skip Sell Stop.                        |
-//|  - At trading window open, place remaining pending orders.        |
-//|  - If one order fills, cancel the other immediately.              |
-//|  - At end time, delete any untriggered pending orders.            |
+//|  Logic:                                                          |
+//|  - D1[1] High = Buy Level,  D1[1] Low = Sell Level              |
+//|  - Observation window (00:00 → start time):                      |
+//|      Ask >= High → block Buys for the day                        |
+//|      Bid <= Low  → block Sells for the day                       |
+//|  - Trading window (start time → end time):                       |
+//|      Ask crosses above High → Buy market order (spread check)    |
+//|      Bid crosses below Low  → Sell market order (spread check)   |
+//|  - One trade per day; entering a Buy blocks Sells and vice-versa |
+//|  - SL/TP anchored to D1[1] High or Low (not fill price)         |
+//|  - Monday: extra observation hour before entries are allowed      |
 //+------------------------------------------------------------------+
 #property copyright "XAUUSD Daily Range Strategy"
-#property version   "1.00"
-#property description "Places Buy/Sell Stops at previous day High/Low (Pepperstone, UTC+2)"
+#property version   "2.00"
+#property description "Market orders on D1 High/Low crossovers (Pepperstone, UTC+2)"
 
 #include <Trade\Trade.mqh>
 
 //=== Inputs =========================================================
 
 input group "== Trading Hours (UTC+2 Broker Server Time) =="
-input int    InpTueFriStartHour = 1;        // Tue-Fri Start Hour  (01:00 = 6pm NY)
+input int    InpTueFriStartHour = 1;        // Tue-Fri Start Hour  (01:00)
 input int    InpTueFriStartMin  = 0;        // Tue-Fri Start Minute
-input int    InpMonStartHour    = 2;        // Monday Start Hour   (02:00 = 7pm NY)
+input int    InpMonStartHour    = 2;        // Monday Start Hour   (02:00)
 input int    InpMonStartMin     = 0;        // Monday Start Minute
-input int    InpEndHour         = 19;       // End Hour - all days (19:00 = 12pm NY)
+input int    InpEndHour         = 19;       // End Hour            (19:00)
 input int    InpEndMin          = 0;        // End Minute
 
 input group "== Strategy Parameters =="
-input double InpRangePercent    = 10.0;     // SL: % of previous candle range
+input double InpRangePercent    = 10.0;     // SL: % of D1[1] range
 input double InpRiskReward      = 1.0;      // TP: Risk-to-Reward ratio
 input double InpRiskPercent     = 1.0;      // Risk: % of account balance per trade
+input double InpMaxSpreadPoints = 30.0;     // Max spread in points for entry
 
 input group "== EA Settings =="
 input long   InpMagicNumber     = 20240101; // EA Magic Number
@@ -39,88 +43,38 @@ input long   InpMagicNumber     = 20240101; // EA Magic Number
 
 CTrade trade;
 
-// Previous candle reference
+// Session levels
 double g_prevHigh = 0.0;
 double g_prevLow  = 0.0;
-double g_slDist   = 0.0;   // SL distance in price units
-double g_tpDist   = 0.0;   // TP distance in price units
+double g_slDist   = 0.0;   // SL distance in price units (10% of D1[1] range)
+double g_tpDist   = 0.0;   // TP distance in price units (slDist * R:R)
 
-// Pending order tickets (0 = not placed / already gone)
-ulong g_buyTicket  = 0;
-ulong g_sellTicket = 0;
+// Direction gates
+bool g_buyBlocked  = false;  // Buy direction disabled for today
+bool g_sellBlocked = false;  // Sell direction disabled for today
+bool g_tradedToday = false;  // A trade has already been entered today
 
-// Session state
-bool g_buyBreached   = false;  // High breached during observation → skip Buy
-bool g_sellBreached  = false;  // Low  breached during observation → skip Sell
-bool g_ordersPlaced  = false;  // Orders have been placed this session
-bool g_cleanupDone   = false;  // EOD cleanup has run
-bool g_sessionReady  = false;  // Valid session data loaded
+// Cross detection: store previous tick's prices
+double g_lastAsk = 0.0;
+double g_lastBid = 0.0;
 
-// Day tracker — server day integer, resets on each Pepperstone daily candle
-int g_lastServerDay = -1;
+// Session / day state
+bool g_sessionReady = false;
+bool g_cleanupDone  = false;
+int  g_lastServerDay = -1;
 
 //+------------------------------------------------------------------+
-//| Return current broker server time (UTC+2) as MqlDateTime         |
+//| Server time helpers                                               |
 //+------------------------------------------------------------------+
-MqlDateTime GetSrvDateTime()
-{
-   MqlDateTime dt;
-   TimeToStruct(TimeCurrent(), dt);
-   return dt;
-}
-
-// Time comparison helpers (broker server time)
+MqlDateTime GetSrvDT() { MqlDateTime dt; TimeToStruct(TimeCurrent(), dt); return dt; }
 bool SrvTimeGE(int h, int m, const MqlDateTime &dt) { return dt.hour > h || (dt.hour == h && dt.min >= m); }
 bool SrvTimeLT(int h, int m, const MqlDateTime &dt) { return dt.hour < h || (dt.hour == h && dt.min <  m); }
 
 //+------------------------------------------------------------------+
-//| Calculate lot size so that SL distance = InpRiskPercent of        |
-//| account balance.                                                  |
-//+------------------------------------------------------------------+
-double CalcLots(double slDist)
-{
-   if (slDist <= 0.0) return 0.0;
-
-   double balance  = AccountInfoDouble(ACCOUNT_BALANCE);
-   double riskAmt  = balance * InpRiskPercent / 100.0;
-   double tickSz   = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
-   double tickVal  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
-   if (tickSz <= 0.0 || tickVal <= 0.0) return 0.0;
-
-   // Dollar value per 1 lot per 1 price unit of movement
-   double valPerUnit = tickVal / tickSz;
-   double lots       = riskAmt / (slDist * valPerUnit);
-
-   // Normalise to broker lot constraints
-   double step  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
-   double minL  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
-   double maxL  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
-   lots = MathFloor(lots / step) * step;
-   return MathMax(minL, MathMin(maxL, lots));
-}
-
-//+------------------------------------------------------------------+
-//| Cancel a pending order and zero its tracking variable             |
-//+------------------------------------------------------------------+
-void CancelOrder(ulong &ticket, const string tag)
-{
-   if (ticket == 0) return;
-   if (OrderSelect(ticket))
-   {
-      if (trade.OrderDelete(ticket))
-         PrintFormat("[%s] Cancelled order #%I64u.", tag, ticket);
-      else
-         PrintFormat("[%s] Failed to cancel #%I64u. Err=%d", tag, ticket, GetLastError());
-   }
-   ticket = 0;
-}
-
-//+------------------------------------------------------------------+
-//| Load prev D1 candle (index 1) High/Low and compute SL/TP         |
+//| Load D1[1] High/Low; compute SL and TP distances                 |
 //+------------------------------------------------------------------+
 bool LoadSessionData()
 {
-   // Allow a few retries in case the bar hasn't fully updated yet
    double hi = 0, lo = 0;
    for (int i = 0; i < 5; i++)
    {
@@ -140,130 +94,150 @@ bool LoadSessionData()
 }
 
 //+------------------------------------------------------------------+
-//| Scan for existing EA orders (for restart recovery)                |
+//| Lot sizing: risk InpRiskPercent of balance on this SL distance   |
 //+------------------------------------------------------------------+
-void ScanExistingOrders()
+double CalcLots(double slDist)
 {
-   for (int i = 0; i < OrdersTotal(); i++)
-   {
-      ulong ticket = OrderGetTicket(i);
-      if (!OrderSelect(ticket))                                   continue;
-      if (OrderGetInteger(ORDER_MAGIC)  != InpMagicNumber)        continue;
-      if (OrderGetString(ORDER_SYMBOL)  != _Symbol)               continue;
+   if (slDist <= 0.0) return 0.0;
 
-      long type = OrderGetInteger(ORDER_TYPE);
-      if      (type == ORDER_TYPE_BUY_STOP)  { g_buyTicket  = ticket; g_ordersPlaced = true; }
-      else if (type == ORDER_TYPE_SELL_STOP) { g_sellTicket = ticket; g_ordersPlaced = true; }
+   double balance    = AccountInfoDouble(ACCOUNT_BALANCE);
+   double riskAmt    = balance * InpRiskPercent / 100.0;
+   double tickSz     = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   double tickVal    = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   if (tickSz <= 0.0 || tickVal <= 0.0) return 0.0;
+
+   double valPerUnit = tickVal / tickSz;
+   double lots       = riskAmt / (slDist * valPerUnit);
+
+   double step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   double minL = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxL = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   lots = MathFloor(lots / step) * step;
+   return MathMax(minL, MathMin(maxL, lots));
+}
+
+//+------------------------------------------------------------------+
+//| Spread filter: returns true if current spread is within limit     |
+//+------------------------------------------------------------------+
+bool SpreadOK()
+{
+   double spread = (double)SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
+   if (spread <= InpMaxSpreadPoints) return true;
+   PrintFormat("Spread filter: %.0f pts > max %.0f — entry skipped.", spread, InpMaxSpreadPoints);
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Enter Buy market order                                            |
+//| SL and TP anchored to D1[1] High (not fill price)                |
+//+------------------------------------------------------------------+
+void EnterBuy()
+{
+   if (!SpreadOK()) return;
+
+   int    digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   double lots   = CalcLots(g_slDist);
+   if (lots <= 0.0) { Print("Lot calc failed — Buy skipped."); return; }
+
+   double sl = NormalizeDouble(g_prevHigh - g_slDist, digits);
+   double tp = NormalizeDouble(g_prevHigh + g_tpDist, digits);
+
+   if (trade.Buy(lots, _Symbol, 0, sl, tp, "GS_Buy"))
+   {
+      double fill = trade.ResultPrice();
+      PrintFormat("BUY entered | Fill=%.2f | SL=%.2f | TP=%.2f | Lots=%.2f", fill, sl, tp, lots);
+      g_tradedToday = true;
+      g_sellBlocked = true;   // In a Buy → no Sells for today
+   }
+   else
+      PrintFormat("Buy market FAILED. Err=%d", GetLastError());
+}
+
+//+------------------------------------------------------------------+
+//| Enter Sell market order                                           |
+//| SL and TP anchored to D1[1] Low (not fill price)                 |
+//+------------------------------------------------------------------+
+void EnterSell()
+{
+   if (!SpreadOK()) return;
+
+   int    digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   double lots   = CalcLots(g_slDist);
+   if (lots <= 0.0) { Print("Lot calc failed — Sell skipped."); return; }
+
+   double sl = NormalizeDouble(g_prevLow + g_slDist, digits);
+   double tp = NormalizeDouble(g_prevLow - g_tpDist, digits);
+
+   if (trade.Sell(lots, _Symbol, 0, sl, tp, "GS_Sell"))
+   {
+      double fill = trade.ResultPrice();
+      PrintFormat("SELL entered | Fill=%.2f | SL=%.2f | TP=%.2f | Lots=%.2f", fill, sl, tp, lots);
+      g_tradedToday = true;
+      g_buyBlocked = true;   // In a Sell → no Buys for today
+   }
+   else
+      PrintFormat("Sell market FAILED. Err=%d", GetLastError());
+}
+
+//+------------------------------------------------------------------+
+//| Scan open positions to restore state after EA restart            |
+//+------------------------------------------------------------------+
+void ScanOpenPositions()
+{
+   for (int i = 0; i < PositionsTotal(); i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if (!PositionSelectByTicket(ticket))                         continue;
+      if (PositionGetInteger(POSITION_MAGIC) != InpMagicNumber)    continue;
+      if (PositionGetString(POSITION_SYMBOL) != _Symbol)           continue;
+
+      g_tradedToday = true;
+      long type = PositionGetInteger(POSITION_TYPE);
+      if (type == POSITION_TYPE_BUY)
+      {
+         g_sellBlocked = true;
+         Print("Init: Existing Buy position found — Sells blocked.");
+      }
+      else if (type == POSITION_TYPE_SELL)
+      {
+         g_buyBlocked = true;
+         Print("Init: Existing Sell position found — Buys blocked.");
+      }
+      break;
    }
 }
 
 //+------------------------------------------------------------------+
-//| Reset all per-session state and prepare a new session             |
+//| Reset all session state and load new D1[1] data                  |
 //+------------------------------------------------------------------+
 void NewSession(int serverDOW)
 {
-   // Cancel any leftover orders from the previous session
-   CancelOrder(g_buyTicket,  "Buy-Reset");
-   CancelOrder(g_sellTicket, "Sell-Reset");
-
-   g_prevHigh     = 0.0;  g_prevLow    = 0.0;
-   g_slDist       = 0.0;  g_tpDist     = 0.0;
-   g_buyBreached  = false; g_sellBreached = false;
-   g_ordersPlaced = false; g_cleanupDone  = false;
+   g_prevHigh    = 0.0;  g_prevLow     = 0.0;
+   g_slDist      = 0.0;  g_tpDist      = 0.0;
+   g_buyBlocked  = false; g_sellBlocked = false;
+   g_tradedToday = false;
    g_sessionReady = false;
+   g_cleanupDone  = false;
 
-   // No trading on weekends
-   if (serverDOW == 0 || serverDOW == 6) return;
+   // Seed cross-detection prices so first tick doesn't produce a false cross
+   g_lastAsk = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   g_lastBid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+   if (serverDOW == 0 || serverDOW == 6) return;   // Weekend — no trading
 
    if (!LoadSessionData())
    {
-      Print("Session setup failed — invalid previous candle data.");
+      Print("Session setup failed — invalid D1[1] candle data.");
       return;
    }
 
    g_sessionReady = true;
-   PrintFormat("Session ready [DOW=%d] | Prev High=%.2f | Prev Low=%.2f | SL=%.2f | TP=%.2f",
+   PrintFormat("New session [DOW=%d] | High=%.2f | Low=%.2f | SL=%.2f | TP=%.2f",
                serverDOW, g_prevHigh, g_prevLow, g_slDist, g_tpDist);
 }
 
 //+------------------------------------------------------------------+
-//| Place Buy Stop and/or Sell Stop (honouring observation breaches)  |
-//+------------------------------------------------------------------+
-void PlaceOrders()
-{
-   // If market is not fully open yet (e.g. rollover break), retry on next tick
-   ENUM_SYMBOL_TRADE_MODE tradeMode = (ENUM_SYMBOL_TRADE_MODE)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_MODE);
-   if (tradeMode != SYMBOL_TRADE_MODE_FULL)
-   {
-      Print("Market not ready (", EnumToString(tradeMode), "). Retrying next tick.");
-      return; // g_ordersPlaced stays false — will retry
-   }
-
-   int    digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
-   double lots   = CalcLots(g_slDist);
-
-   if (lots <= 0.0)
-   {
-      Print("Lot calculation failed — orders not placed.");
-      g_ordersPlaced = true;
-      return;
-   }
-
-   // --- Buy Stop ---
-   if (!g_buyBreached && g_buyTicket == 0)
-   {
-      double ask   = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-      double entry = NormalizeDouble(g_prevHigh,            digits);
-      double sl    = NormalizeDouble(g_prevHigh - g_slDist, digits);
-      double tp    = NormalizeDouble(g_prevHigh + g_tpDist, digits);
-
-      if (entry > ask)
-      {
-         if (trade.BuyStop(lots, entry, _Symbol, sl, tp, ORDER_TIME_GTC, 0, "GS_Buy"))
-         {
-            g_buyTicket = trade.ResultOrder();
-            PrintFormat("Buy Stop placed  | Entry=%.2f | SL=%.2f | TP=%.2f | Lots=%.2f",
-                        entry, sl, tp, lots);
-         }
-         else PrintFormat("Buy Stop FAILED. Err=%d", GetLastError());
-      }
-      else
-      {
-         PrintFormat("Buy Stop skipped — Ask (%.2f) already >= High (%.2f).", ask, entry);
-         g_buyBreached = true;
-      }
-   }
-
-   // --- Sell Stop ---
-   if (!g_sellBreached && g_sellTicket == 0)
-   {
-      double bid   = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-      double entry = NormalizeDouble(g_prevLow,            digits);
-      double sl    = NormalizeDouble(g_prevLow + g_slDist, digits);
-      double tp    = NormalizeDouble(g_prevLow - g_tpDist, digits);
-
-      if (entry < bid)
-      {
-         if (trade.SellStop(lots, entry, _Symbol, sl, tp, ORDER_TIME_GTC, 0, "GS_Sell"))
-         {
-            g_sellTicket = trade.ResultOrder();
-            PrintFormat("Sell Stop placed | Entry=%.2f | SL=%.2f | TP=%.2f | Lots=%.2f",
-                        entry, sl, tp, lots);
-         }
-         else PrintFormat("Sell Stop FAILED. Err=%d", GetLastError());
-      }
-      else
-      {
-         PrintFormat("Sell Stop skipped — Bid (%.2f) already <= Low (%.2f).", bid, entry);
-         g_sellBreached = true;
-      }
-   }
-
-   g_ordersPlaced = true;
-}
-
-//+------------------------------------------------------------------+
-//| OnInit                                                           |
+//| OnInit                                                            |
 //+------------------------------------------------------------------+
 int OnInit()
 {
@@ -271,47 +245,44 @@ int OnInit()
    trade.SetDeviationInPoints(20);
    trade.SetTypeFilling(ORDER_FILLING_RETURN);
 
-   // Initialise day tracker
-   MqlDateTime srvDT;
-   TimeToStruct(TimeCurrent(), srvDT);
+   MqlDateTime srvDT = GetSrvDT();
    g_lastServerDay = srvDT.day;
 
-   // Attempt to resume a session if EA starts mid-day on a weekday
+   // Resume mid-session if EA starts on a weekday
    if (srvDT.day_of_week >= 1 && srvDT.day_of_week <= 5)
    {
       if (LoadSessionData())
       {
          g_sessionReady = true;
+         g_lastAsk = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+         g_lastBid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
 
-         // Restore any pending orders this EA already placed
-         ScanExistingOrders();
+         // Restore trade/block state from any existing open position
+         ScanOpenPositions();
 
-         // Do a quick price breach check so we don't place orders in a direction already hit.
-         // Observation always starts at 00:00 server time (candle open), so any mid-day
-         // start is already within or past the observation window.
+         // If no open position, apply conservative breach check from current price
+         if (!g_tradedToday)
          {
-            double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-            double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-            if (ask >= g_prevHigh) { g_buyBreached  = true; Print("Init: High already breached."); }
-            if (bid <= g_prevLow)  { g_sellBreached = true; Print("Init: Low already breached.");  }
+            if (g_lastAsk >= g_prevHigh) { g_buyBlocked  = true; Print("Init: Ask >= High — Buys blocked."); }
+            if (g_lastBid <= g_prevLow)  { g_sellBlocked = true; Print("Init: Bid <= Low  — Sells blocked."); }
          }
 
-         // If past end time, mark cleanup done so we don't re-delete anything
+         // If already past end time, mark cleanup done
          if (SrvTimeGE(InpEndHour, InpEndMin, srvDT))
             g_cleanupDone = true;
 
-         PrintFormat("EA resumed mid-session [DOW=%d] | High=%.2f | Low=%.2f | OrdersPlaced=%s",
+         PrintFormat("EA resumed mid-session [DOW=%d] | High=%.2f | Low=%.2f | Traded=%s",
                      srvDT.day_of_week, g_prevHigh, g_prevLow,
-                     g_ordersPlaced ? "Yes" : "No");
+                     g_tradedToday ? "Yes" : "No");
       }
    }
 
-   Print("Gold Strategy EA initialised. Magic=", InpMagicNumber);
+   Print("Gold Strategy EA v2 initialised. Magic=", InpMagicNumber);
    return INIT_SUCCEEDED;
 }
 
 //+------------------------------------------------------------------+
-//| OnDeinit                                                         |
+//| OnDeinit                                                          |
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
@@ -320,109 +291,83 @@ void OnDeinit(const int reason)
 
 //+------------------------------------------------------------------+
 //| OnTick — Main state machine                                       |
-//|                                                                  |
-//| Phases (all times in UTC+2 broker server time):                  |
-//|  [00:00 – StartTime]  Observation  — track price breaches        |
-//|  [StartTime – EndTime] Trading      — manage pending orders       |
-//|  [EndTime+]           Cleanup       — delete untriggered orders   |
+//|                                                                   |
+//| Phases (all times in UTC+2 broker server time):                   |
+//|  [00:00 – StartTime]   Observation — detect direction breaches    |
+//|  [StartTime – EndTime] Trading     — fire market orders on cross  |
+//|  [EndTime+]            Done        — flag cleanup                 |
 //+------------------------------------------------------------------+
 void OnTick()
 {
-   //--- Detect Pepperstone daily candle rollover (server midnight = 00:00 UTC+2)
-   MqlDateTime srvDT;
-   TimeToStruct(TimeCurrent(), srvDT);
+   MqlDateTime srvDT = GetSrvDT();
 
+   //--- Detect Pepperstone daily rollover (00:00 UTC+2)
    if (srvDT.day != g_lastServerDay)
    {
       g_lastServerDay = srvDT.day;
       NewSession(srvDT.day_of_week);
    }
 
-   // Skip weekends and sessions with no valid data
    if (!g_sessionReady || srvDT.day_of_week == 0 || srvDT.day_of_week == 6)
       return;
 
-   //--- Resolve timing parameters for today
-   bool isMonday   = (srvDT.day_of_week == 1);
-   int  sH         = isMonday ? InpMonStartHour : InpTueFriStartHour;
-   int  sM         = isMonday ? InpMonStartMin  : InpTueFriStartMin;
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
 
-   // Observation runs from 00:00 (candle open) up to the trading start time
-   bool inObs      = SrvTimeLT(sH, sM,                        srvDT);
-   bool inTrading  = SrvTimeGE(sH, sM,         srvDT) && SrvTimeLT(InpEndHour, InpEndMin, srvDT);
-   bool pastEnd    = SrvTimeGE(InpEndHour, InpEndMin, srvDT);
+   bool isMonday  = (srvDT.day_of_week == 1);
+   int  sH = isMonday ? InpMonStartHour    : InpTueFriStartHour;
+   int  sM = isMonday ? InpMonStartMin     : InpTueFriStartMin;
+
+   bool inObs     = SrvTimeLT(sH, sM,                          srvDT);
+   bool inTrading = SrvTimeGE(sH, sM, srvDT) && SrvTimeLT(InpEndHour, InpEndMin, srvDT);
+   bool pastEnd   = SrvTimeGE(InpEndHour, InpEndMin,           srvDT);
 
    //----------------------------------------------------------------
-   // Phase 1 — Observation window: track price vs prev High/Low
+   // Phase 1 — Observation window
+   // Track whether price breaches D1[1] High or Low before trading
+   // starts. For Monday this covers the extra waiting hour.
    //----------------------------------------------------------------
    if (inObs)
    {
-      double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-      double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-
-      if (!g_buyBreached  && ask >= g_prevHigh)
+      if (!g_buyBlocked && ask >= g_prevHigh)
       {
-         g_buyBreached = true;
-         PrintFormat("Observation: Ask %.2f >= High %.2f — Buy Stop will NOT be placed.", ask, g_prevHigh);
+         g_buyBlocked = true;
+         PrintFormat("Obs: Ask %.2f >= High %.2f — Buys blocked for today.", ask, g_prevHigh);
       }
-      if (!g_sellBreached && bid <= g_prevLow)
+      if (!g_sellBlocked && bid <= g_prevLow)
       {
-         g_sellBreached = true;
-         PrintFormat("Observation: Bid %.2f <= Low %.2f — Sell Stop will NOT be placed.", bid, g_prevLow);
+         g_sellBlocked = true;
+         PrintFormat("Obs: Bid %.2f <= Low %.2f — Sells blocked for today.", bid, g_prevLow);
       }
-      return;
    }
 
    //----------------------------------------------------------------
-   // Phase 2 — Place orders at trading window open
+   // Phase 2 — Trading window
+   // Watch for Ask crossing above High (Buy) or Bid crossing below
+   // Low (Sell). Only one trade per day.
    //----------------------------------------------------------------
-   if (inTrading && !g_ordersPlaced)
-      PlaceOrders();
+   else if (inTrading && !g_tradedToday)
+   {
+      // Buy: Ask crosses above D1[1] High
+      if (!g_buyBlocked && g_lastAsk <= g_prevHigh && ask > g_prevHigh)
+         EnterBuy();
+
+      // Sell: Bid crosses below D1[1] Low (re-check tradedToday in case Buy just fired)
+      if (!g_sellBlocked && !g_tradedToday && g_lastBid >= g_prevLow && bid < g_prevLow)
+         EnterSell();
+   }
 
    //----------------------------------------------------------------
-   // Phase 3 — EOD cleanup: delete untriggered pending orders
+   // Phase 3 — Past end time
    //----------------------------------------------------------------
-   if (pastEnd && !g_cleanupDone)
+   else if (pastEnd && !g_cleanupDone)
    {
-      PrintFormat("Trading window closed (%02d:%02d UTC+2). Removing pending orders.", InpEndHour, InpEndMin);
-      CancelOrder(g_buyTicket,  "Buy-EOD");
-      CancelOrder(g_sellTicket, "Sell-EOD");
+      PrintFormat("Trading window closed (%02d:%02d UTC+2).", InpEndHour, InpEndMin);
       g_cleanupDone = true;
    }
-}
 
-//+------------------------------------------------------------------+
-//| OnTradeTransaction — react instantly when a pending order fills   |
-//+------------------------------------------------------------------+
-void OnTradeTransaction(const MqlTradeTransaction &trans,
-                        const MqlTradeRequest     &request,
-                        const MqlTradeResult      &result)
-{
-   // We only care about new deals (pending order → position)
-   if (trans.type != TRADE_TRANSACTION_DEAL_ADD) return;
-   if (!HistoryDealSelect(trans.deal))            return;
-
-   // Verify it belongs to this EA on this symbol
-   if (HistoryDealGetInteger(trans.deal, DEAL_MAGIC)  != InpMagicNumber) return;
-   if (HistoryDealGetString (trans.deal, DEAL_SYMBOL) != _Symbol)        return;
-
-   // Only care about position-opening deals (entry)
-   if (HistoryDealGetInteger(trans.deal, DEAL_ENTRY) != DEAL_ENTRY_IN)   return;
-
-   // The order ticket that triggered this deal
-   ulong fromOrder = (ulong)HistoryDealGetInteger(trans.deal, DEAL_ORDER);
-
-   if (fromOrder == g_buyTicket && g_buyTicket != 0)
-   {
-      PrintFormat("Buy Stop #%I64u filled — cancelling Sell Stop.", g_buyTicket);
-      g_buyTicket = 0;  // Now a position, no longer a pending order
-      CancelOrder(g_sellTicket, "Sell-Opposite");
-   }
-   else if (fromOrder == g_sellTicket && g_sellTicket != 0)
-   {
-      PrintFormat("Sell Stop #%I64u filled — cancelling Buy Stop.", g_sellTicket);
-      g_sellTicket = 0;
-      CancelOrder(g_buyTicket, "Buy-Opposite");
-   }
+   // Store current prices for next tick's cross detection
+   g_lastAsk = ask;
+   g_lastBid = bid;
 }
 //+------------------------------------------------------------------+
