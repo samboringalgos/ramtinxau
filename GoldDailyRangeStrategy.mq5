@@ -5,10 +5,10 @@
 //|  Logic:                                                          |
 //|  - D1[1] High = Buy Level,  D1[1] Low = Sell Level              |
 //|  - Observation window (00:00 → start time):                      |
-//|      Ask >= High → block Buys for the day                        |
+//|      Bid >= High → block Buys for the day                        |
 //|      Bid <= Low  → block Sells for the day                       |
 //|  - Trading window (start time → end time):                       |
-//|      Ask crosses above High → Buy market order (spread check)    |
+//|      Bid crosses above High → Buy market order (spread check)    |
 //|      Bid crosses below Low  → Sell market order (spread check)   |
 //|  - One trade per day; entering a Buy blocks Sells and vice-versa |
 //|  - SL/TP anchored to D1[1] High or Low (not fill price)         |
@@ -54,8 +54,7 @@ bool g_buyBlocked  = false;  // Buy direction disabled for today
 bool g_sellBlocked = false;  // Sell direction disabled for today
 bool g_tradedToday = false;  // A trade has already been entered today
 
-// Cross detection: store previous tick's prices
-double g_lastAsk = 0.0;
+// Cross detection: previous tick's bid (D1 bars are bid-based; use bid throughout)
 double g_lastBid = 0.0;
 
 // Session / day state
@@ -219,8 +218,7 @@ void NewSession(int serverDOW)
    g_sessionReady = false;
    g_cleanupDone  = false;
 
-   // Seed cross-detection prices so first tick doesn't produce a false cross
-   g_lastAsk = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   // Seed cross-detection bid so first tick doesn't produce a false cross
    g_lastBid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
 
    if (serverDOW == 0 || serverDOW == 6) return;   // Weekend — no trading
@@ -254,7 +252,6 @@ int OnInit()
       if (LoadSessionData())
       {
          g_sessionReady = true;
-         g_lastAsk = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
          g_lastBid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
 
          // Restore trade/block state from any existing open position
@@ -263,7 +260,7 @@ int OnInit()
          // If no open position, apply conservative breach check from current price
          if (!g_tradedToday)
          {
-            if (g_lastAsk >= g_prevHigh) { g_buyBlocked  = true; Print("Init: Ask >= High — Buys blocked."); }
+            if (g_lastBid >= g_prevHigh) { g_buyBlocked  = true; Print("Init: Bid >= High — Buys blocked."); }
             if (g_lastBid <= g_prevLow)  { g_sellBlocked = true; Print("Init: Bid <= Low  — Sells blocked."); }
          }
 
@@ -311,7 +308,6 @@ void OnTick()
    if (!g_sessionReady || srvDT.day_of_week == 0 || srvDT.day_of_week == 6)
       return;
 
-   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
 
    bool isMonday  = (srvDT.day_of_week == 1);
@@ -329,10 +325,10 @@ void OnTick()
    //----------------------------------------------------------------
    if (inObs)
    {
-      if (!g_buyBlocked && ask >= g_prevHigh)
+      if (!g_buyBlocked && bid >= g_prevHigh)
       {
          g_buyBlocked = true;
-         PrintFormat("Obs: Ask %.2f >= High %.2f — Buys blocked for today.", ask, g_prevHigh);
+         PrintFormat("Obs: Bid %.2f >= High %.2f — Buys blocked for today.", bid, g_prevHigh);
       }
       if (!g_sellBlocked && bid <= g_prevLow)
       {
@@ -348,8 +344,8 @@ void OnTick()
    //----------------------------------------------------------------
    else if (inTrading && !g_tradedToday)
    {
-      // Buy: Ask crosses above D1[1] High
-      if (!g_buyBlocked && g_lastAsk <= g_prevHigh && ask > g_prevHigh)
+      // Buy: Bid crosses above D1[1] High (D1 bars are bid-based)
+      if (!g_buyBlocked && g_lastBid <= g_prevHigh && bid > g_prevHigh)
          EnterBuy();
 
       // Sell: Bid crosses below D1[1] Low (re-check tradedToday in case Buy just fired)
@@ -366,8 +362,7 @@ void OnTick()
       g_cleanupDone = true;
    }
 
-   // Store current prices for next tick's cross detection
-   g_lastAsk = ask;
+   // Store current bid for next tick's cross detection
    g_lastBid = bid;
 }
 //+------------------------------------------------------------------+
