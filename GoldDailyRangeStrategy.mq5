@@ -14,6 +14,7 @@
 //|  - One trade per day; entering a Buy blocks Sells and vice-versa |
 //|  - SL/TP anchored to D1[1] High or Low (not fill price)         |
 //|  - Monday: extra observation hour before entries are allowed     |
+//|  - Optional: skip session if D1[1] range < N × ATR(D1)          |
 //|                                                                  |
 //|  Note: All input hours are in broker server time. Pepperstone    |
 //|  uses EET (UTC+2 winter, UTC+3 summer). If DST causes trading    |
@@ -21,7 +22,7 @@
 //|  hours manually after each DST transition.                       |
 //+------------------------------------------------------------------+
 #property copyright "XAUUSD Daily Range Strategy"
-#property version   "3.00"
+#property version   "4.00"
 #property description "Market orders on D1 High/Low crossovers (Pepperstone)"
 
 #include <Trade\Trade.mqh>
@@ -42,6 +43,11 @@ input double InpRiskReward      = 1.0;      // TP: Risk-to-Reward ratio
 input double InpRiskPercent     = 1.0;      // Risk: % of account balance per trade
 input double InpMaxSpreadPoints = 30.0;     // Max spread in points for entry
 
+input group "== Range Filter =="
+input bool   InpUseMinRangeFilter = false;  // Enable minimum daily range filter
+input double InpMinRangeATRMult   = 0.5;    // Min D1[1] range as multiple of D1 ATR
+input int    InpATRPeriod         = 14;     // ATR period (Daily bars)
+
 input group "== Order Settings =="
 input int    InpDeviationPoints = 50;       // Max slippage (points) accepted on fill
 input long   InpMagicNumber     = 20240101; // EA Magic Number
@@ -49,6 +55,9 @@ input long   InpMagicNumber     = 20240101; // EA Magic Number
 //=== Globals ========================================================
 
 CTrade trade;
+
+// ATR indicator handle (created in OnInit if InpUseMinRangeFilter is true)
+int g_atrHandle = INVALID_HANDLE;
 
 // Session levels (from D1[1], loaded at midnight)
 double g_prevHigh = 0.0;
@@ -112,6 +121,53 @@ bool LoadSessionDataWithRetry()
       Sleep(100);
    }
    return false;
+}
+
+//+------------------------------------------------------------------+
+//| Range filter: compare D1[1] range against N × ATR(D1).          |
+//|                                                                   |
+//| Must be called AFTER TryLoadSessionData() has populated          |
+//| g_prevHigh and g_prevLow.                                        |
+//|                                                                   |
+//| Returns true  → session is eligible for trading.                 |
+//| Returns false → session is skipped (range too narrow).           |
+//|                                                                   |
+//| Fails open (returns true) if ATR data is unavailable, so that   |
+//| a data hiccup does not silently suppress valid signals.          |
+//+------------------------------------------------------------------+
+bool CheckSessionFilters()
+{
+   if (!InpUseMinRangeFilter) return true;
+
+   if (g_atrHandle == INVALID_HANDLE)
+   {
+      Print("Range filter: ATR handle invalid — filter bypassed, session allowed.");
+      return true;
+   }
+
+   // Fetch ATR[1]: yesterday's fully-formed ATR bar, matching D1[1]
+   double atrBuf[];
+   ArraySetAsSeries(atrBuf, true);
+   if (CopyBuffer(g_atrHandle, 0, 1, 1, atrBuf) <= 0)
+   {
+      PrintFormat("Range filter: CopyBuffer failed (err=%d) — filter bypassed, session allowed.", GetLastError());
+      return true;
+   }
+
+   double range    = g_prevHigh - g_prevLow;
+   double atr      = atrBuf[0];
+   double minRange = InpMinRangeATRMult * atr;
+
+   if (range < minRange)
+   {
+      PrintFormat("Range filter REJECTED: D1[1] range=%.2f < %.2f × ATR(%d)=%.2f — session skipped.",
+                  range, InpMinRangeATRMult, InpATRPeriod, atr);
+      return false;
+   }
+
+   PrintFormat("Range filter PASSED: D1[1] range=%.2f >= %.2f × ATR(%d)=%.2f — session active.",
+               range, InpMinRangeATRMult, InpATRPeriod, atr);
+   return true;
 }
 
 //+------------------------------------------------------------------+
@@ -290,6 +346,9 @@ void ScanTodayHistory()
 //+------------------------------------------------------------------+
 //| Reset all session state. D1[1] data load is attempted            |
 //| immediately; deferred to next tick if not yet ready.             |
+//| Range filter is applied after data loads — if it rejects,        |
+//| g_sessionReady stays false and g_needsDataLoad is not set,       |
+//| so the EA idles for the day without retrying.                    |
 //+------------------------------------------------------------------+
 void NewSession(int serverDOW)
 {
@@ -309,9 +368,14 @@ void NewSession(int serverDOW)
 
    if (TryLoadSessionData())
    {
-      g_sessionReady = true;
-      PrintFormat("New session [DOW=%d] | High=%.2f | Low=%.2f | SL=%.2f | TP=%.2f",
-                  serverDOW, g_prevHigh, g_prevLow, g_slDist, g_tpDist);
+      if (CheckSessionFilters())
+      {
+         g_sessionReady = true;
+         PrintFormat("New session [DOW=%d] | High=%.2f | Low=%.2f | SL=%.2f | TP=%.2f",
+                     serverDOW, g_prevHigh, g_prevLow, g_slDist, g_tpDist);
+      }
+      // else: filter rejected — g_sessionReady stays false, g_needsDataLoad stays false
+      //       EA idles today; no retry (data was available, session was intentionally skipped)
    }
    else
    {
@@ -325,9 +389,27 @@ void NewSession(int serverDOW)
 //+------------------------------------------------------------------+
 int OnInit()
 {
+   // Validate range filter inputs before creating any handles
+   if (InpUseMinRangeFilter && InpATRPeriod <= 0)
+   {
+      Print("ERROR: InpATRPeriod must be > 0.");
+      return INIT_FAILED;
+   }
+
    trade.SetExpertMagicNumber(InpMagicNumber);
    trade.SetDeviationInPoints(InpDeviationPoints);
    trade.SetTypeFillingBySymbol(_Symbol);  // Query broker for supported fill mode
+
+   // Create ATR handle only when the filter is enabled
+   if (InpUseMinRangeFilter)
+   {
+      g_atrHandle = iATR(_Symbol, PERIOD_D1, InpATRPeriod);
+      if (g_atrHandle == INVALID_HANDLE)
+      {
+         PrintFormat("ERROR: Failed to create ATR(%d) indicator handle.", InpATRPeriod);
+         return INIT_FAILED;
+      }
+   }
 
    MqlDateTime srvDT = GetSrvDT();
    g_lastServerDay = srvDT.day;
@@ -337,45 +419,51 @@ int OnInit()
    {
       if (LoadSessionDataWithRetry())
       {
-         g_sessionReady = true;
-         g_lastBid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-
-         // Step 1: check for an open position from this EA
-         ScanOpenPositions();
-
-         // Step 2: if no open position, check deal history for a completed trade today
-         if (!g_tradedToday)
-            ScanTodayHistory();
-
-         // Step 3: if still no trade recorded, apply observation-window breach check —
-         //         but ONLY if we are still within the observation window right now.
-         //         During the trading window, the cross-detection logic handles blocking;
-         //         applying a price-based block here would prevent valid entries.
-         if (!g_tradedToday)
+         if (CheckSessionFilters())
          {
-            bool isMonday = (srvDT.day_of_week == 1);
-            int  sH = isMonday ? InpMonStartHour : InpTueFriStartHour;
-            int  sM = isMonday ? InpMonStartMin  : InpTueFriStartMin;
+            g_sessionReady = true;
+            g_lastBid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
 
-            if (SrvTimeLT(sH, sM, srvDT))  // Still in observation window
+            // Step 1: check for an open position from this EA
+            ScanOpenPositions();
+
+            // Step 2: if no open position, check deal history for a completed trade today
+            if (!g_tradedToday)
+               ScanTodayHistory();
+
+            // Step 3: if still no trade recorded, apply observation-window breach check —
+            //         but ONLY if we are still within the observation window right now.
+            //         During the trading window, the cross-detection logic handles blocking;
+            //         applying a price-based block here would prevent valid entries.
+            if (!g_tradedToday)
             {
-               if (g_lastBid >= g_prevHigh) { g_buyBlocked  = true; Print("Init: Bid >= High in obs window — Buys blocked."); }
-               if (g_lastBid <= g_prevLow)  { g_sellBlocked = true; Print("Init: Bid <= Low in obs window — Sells blocked."); }
+               bool isMonday = (srvDT.day_of_week == 1);
+               int  sH = isMonday ? InpMonStartHour : InpTueFriStartHour;
+               int  sM = isMonday ? InpMonStartMin  : InpTueFriStartMin;
+
+               if (SrvTimeLT(sH, sM, srvDT))  // Still in observation window
+               {
+                  if (g_lastBid >= g_prevHigh) { g_buyBlocked  = true; Print("Init: Bid >= High in obs window — Buys blocked."); }
+                  if (g_lastBid <= g_prevLow)  { g_sellBlocked = true; Print("Init: Bid <= Low in obs window — Sells blocked."); }
+               }
             }
+
+            if (SrvTimeGE(InpEndHour, InpEndMin, srvDT))
+               g_cleanupDone = true;
+
+            PrintFormat("EA resumed [DOW=%d] | High=%.2f | Low=%.2f | Traded=%s | BuyBlocked=%s | SellBlocked=%s",
+                        srvDT.day_of_week, g_prevHigh, g_prevLow,
+                        g_tradedToday  ? "Yes" : "No",
+                        g_buyBlocked   ? "Yes" : "No",
+                        g_sellBlocked  ? "Yes" : "No");
          }
-
-         if (SrvTimeGE(InpEndHour, InpEndMin, srvDT))
-            g_cleanupDone = true;
-
-         PrintFormat("EA resumed [DOW=%d] | High=%.2f | Low=%.2f | Traded=%s | BuyBlocked=%s | SellBlocked=%s",
-                     srvDT.day_of_week, g_prevHigh, g_prevLow,
-                     g_tradedToday  ? "Yes" : "No",
-                     g_buyBlocked   ? "Yes" : "No",
-                     g_sellBlocked  ? "Yes" : "No");
+         // else: range filter rejected today — g_sessionReady stays false, EA idles
       }
+      // else: data unavailable after 10 retries — g_sessionReady stays false
    }
 
-   Print("Gold Strategy EA v3 initialised. Magic=", InpMagicNumber);
+   PrintFormat("Gold Strategy EA v4 initialised. Magic=%d | RangeFilter=%s",
+               InpMagicNumber, InpUseMinRangeFilter ? "ON" : "OFF");
    return INIT_SUCCEEDED;
 }
 
@@ -384,6 +472,11 @@ int OnInit()
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
+   if (g_atrHandle != INVALID_HANDLE)
+   {
+      IndicatorRelease(g_atrHandle);
+      g_atrHandle = INVALID_HANDLE;
+   }
    Print("EA stopped. Reason=", reason);
 }
 
@@ -407,16 +500,23 @@ void OnTick()
    }
 
    //--- Deferred D1[1] load: retry each tick without any Sleep()
+   //    Range filter is applied immediately after data becomes available.
+   //    If filter rejects: g_needsDataLoad is cleared, g_sessionReady stays
+   //    false — no further retries, EA idles for the day.
    if (g_needsDataLoad)
    {
       if (TryLoadSessionData())
       {
          g_needsDataLoad = false;
-         g_sessionReady  = true;
-         PrintFormat("Session data loaded on retry | High=%.2f | Low=%.2f | SL=%.2f | TP=%.2f",
-                     g_prevHigh, g_prevLow, g_slDist, g_tpDist);
+         if (CheckSessionFilters())
+         {
+            g_sessionReady = true;
+            PrintFormat("Session data loaded on retry | High=%.2f | Low=%.2f | SL=%.2f | TP=%.2f",
+                        g_prevHigh, g_prevLow, g_slDist, g_tpDist);
+         }
+         // else: filter rejected — g_sessionReady stays false, no retry
       }
-      else return;  // Not ready yet — try again next tick
+      else return;  // Data not ready yet — try again next tick
    }
 
    if (!g_sessionReady || srvDT.day_of_week == 0 || srvDT.day_of_week == 6)
